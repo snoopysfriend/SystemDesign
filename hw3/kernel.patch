@@ -1,0 +1,183 @@
+diff --git a/arch/arm/tools/syscall.tbl b/arch/arm/tools/syscall.tbl
+index 6da7dc4d79cc..0dbb10e3face 100644
+--- a/arch/arm/tools/syscall.tbl
++++ b/arch/arm/tools/syscall.tbl
+@@ -449,3 +449,4 @@
+ 433	common	fspick				sys_fspick
+ 434	common	pidfd_open			sys_pidfd_open
+ 435	common	clone3				sys_clone3
++435	common	expose_pte			sys_expose_pte
+diff --git a/arch/arm64/kernel/sys.c b/arch/arm64/kernel/sys.c
+index d5ffaaab31a7..fac83385229a 100644
+--- a/arch/arm64/kernel/sys.c
++++ b/arch/arm64/kernel/sys.c
+@@ -36,6 +36,151 @@ SYSCALL_DEFINE1(arm64_personality, unsigned int, personality)
+ 	return ksys_personality(personality);
+ }
+ 
++#ifndef CONFIG_PTE
++struct expose_pte_args {
++	pid_t pid;
++	/* begin userspace VA of the flattened page table */
++	unsigned long begin_fpt_vaddr;
++	/* end userspace VA of the flattened page table */
++	unsigned long end_fpt_vaddr;
++	/* begin userspace VA of the remapped PTE table */
++	unsigned long begin_pte_vaddr;
++	/* end userspace VA of the remapped PTE table */
++	unsigned long end_pte_vaddr;
++	/* begin of userspace VA to expose PTE mappings */
++	unsigned long begin_vaddr;
++	/* end of userspace VA to expose PTE mappings */
++	unsigned long end_vaddr;
++};
++
++
++int follow_pte(struct mm_struct *mm, unsigned long address,
++		pmd_t **pmdp)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++
++	pgd = pgd_offset(mm, address);
++	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))
++		goto out;
++
++	/* this one is fold-function not actually called for 4-level */
++	p4d = p4d_offset(pgd, address);
++	if (p4d_none(*p4d) || unlikely(p4d_bad(*p4d)))
++		goto out;
++	pud = pud_offset(p4d, address);
++	if (pud_none(*pud) || unlikely(pud_bad(*pud)))
++		goto out;
++	pmd = pmd_offset(pud, address);
++	VM_BUG_ON(pmd_trans_huge(*pmd));
++
++	if (pmd_none(*pmd) || unlikely(pmd_bad(*pmd)))
++		goto out;
++	*pmdp = pmd;
++	return 0;
++out:
++	return -EINVAL;
++}
++
++#define PTE_ADDR_SIZE (PTRS_PER_PTE * PAGE_SIZE)  /* 2 ^ (9 + 12) */
++#define PTE_TABLE_SIZE (PTRS_PER_PTE * sizeof(pte_t))
++#define PTE_TABLE_MASK (PAGE_SIZE-1)
++
++SYSCALL_DEFINE1(expose_pte, struct expose_pte_args __user *, args)
++{
++	struct task_struct *task;
++	struct vm_area_struct *vma;
++	long error = -EINVAL;
++	pmd_t *pte_table;
++	pgprot_t prot;
++	unsigned long pfn, size;
++	unsigned long addr, end;
++	unsigned long fpt_addr;
++	unsigned long pte_start, zero;
++	struct expose_pte_args *expose;
++	unsigned long fpt_size, pte_size, table_size;
++
++
++	if (!access_ok(args, sizeof(struct expose_pte_args)))
++		goto out;
++
++	expose = kmalloc(sizeof(struct expose_pte_args), GFP_KERNEL);
++	if (copy_from_user(expose, args, sizeof(struct expose_pte_args)))
++		goto out;
++
++	rcu_read_lock();
++	read_lock(&tasklist_lock);
++	task = find_task_by_vpid(args->pid);
++	if (!task)
++		goto out_unlock;
++
++	pr_info("find %s\n", task->comm);
++	addr = __ALIGN_MASK(args->begin_vaddr, PTE_TABLE_MASK);
++	fpt_size = (expose->end_fpt_vaddr - expose->begin_fpt_vaddr)
++				/ sizeof(unsigned long);
++	pte_size = (expose->end_pte_vaddr - expose->begin_pte_vaddr)
++				/ PTRS_PER_PTE;
++	table_size = (expose->end_vaddr - expose->begin_vaddr) / PTE_ADDR_SIZE;
++	if (fpt_size < table_size || pte_size < table_size) {
++		pr_info("[error] fpt or pte size too small]\n");
++		goto out_unlock;
++	}
++
++	end = expose->end_vaddr;
++	fpt_addr = expose->begin_fpt_vaddr;
++	pte_start = expose->begin_pte_vaddr;
++	zero = 0;
++
++	do {
++		error = follow_pte(task->mm, addr, &pte_table);
++		if (error) { /* page fault */
++			if (copy_to_user((void *)fpt_addr, &zero, 8)) {
++				pr_info("[error] cannot copy to fpt\n");
++				goto out_unlock;
++			}
++			fpt_addr += sizeof(unsigned long); // 64 bits 1 entry
++			continue;
++		}
++		vma = find_vma(current->mm, args->begin_pte_vaddr);
++		if (!vma) {
++			pr_info("[error] cannot find vma\n");
++			goto out_unlock;
++		}
++		size = vma->vm_end - pte_start;
++		prot = vm_get_page_prot(vma->vm_flags);
++		pfn = (__pmd_to_phys(*pte_table)>>PAGE_SHIFT) + vma->vm_pgoff;
++		if (size < PTE_TABLE_SIZE)
++			goto out_unlock;
++		if (remap_pfn_range(vma, pte_start, pfn,
++					PTE_TABLE_SIZE, prot)) {
++			pr_info("[error] cannot remap\n");
++			goto out_unlock;
++		}
++		/* TODO if fpt address page fault handle it */
++		if (copy_to_user((void *)fpt_addr, &pte_start, 8)) {
++			pr_info("[error] cannot copy to fpt\n");
++			goto out_unlock;
++		}
++		/* know we just linearly get next */
++		fpt_addr += sizeof(unsigned long); // 64 bits 1 entry
++		pte_start += PTE_TABLE_SIZE;
++	} while (addr += PTE_ADDR_SIZE, addr <= end);
++	/* success remapped */
++	error = 0;
++
++out_unlock:
++	read_unlock(&tasklist_lock);
++	rcu_read_unlock();
++	kfree(expose);
++out:
++	return error;
++}
++
++#endif /* CONFIG_PTE */
++
++
+ asmlinkage long sys_ni_syscall(void);
+ 
+ asmlinkage long __arm64_sys_ni_syscall(const struct pt_regs *__unused)
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1fc8faa6e973..d748d99bab18 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -849,10 +849,12 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ #ifdef __ARCH_WANT_SYS_CLONE3
+ #define __NR_clone3 435
+ __SYSCALL(__NR_clone3, sys_clone3)
++#define __NR_expose_pte 436
++__SYSCALL(__NR_expose_pte, sys_expose_pte)
+ #endif
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 436
++#define __NR_syscalls 437
+ 
+ /*
+  * 32 bit systems traditionally used different
